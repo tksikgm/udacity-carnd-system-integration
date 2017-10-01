@@ -1,11 +1,10 @@
 #!/usr/bin/env python
 import rospy
 from std_msgs.msg import Header, Int32
-from geometry_msgs.msg import PoseStamped, Pose, PointStamped
-from styx_msgs.msg import TrafficLightArray, TrafficLight
-from styx_msgs.msg import Lane
+from geometry_msgs.msg import PoseStamped, Pose, PointStamped, Point
+from styx_msgs.msg import Lane, TrafficLightArray, TrafficLight
 from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
+from cv_bridge import CvBridge, CvBridgeError
 from light_classification.tl_classifier import TLClassifier
 import tf
 import cv2
@@ -19,6 +18,7 @@ class TLDetector(object):
         rospy.init_node('tl_detector')
 
         self.pose = None
+        self.car_position = Point()
         self.waypoints = None
         self.camera_image = None
         self.lights = []
@@ -38,8 +38,18 @@ class TLDetector(object):
 
         config_string = rospy.get_param("/traffic_light_config")
         self.config = yaml.load(config_string)
+        # List of positions that correspond to the line to stop in front of for a given intersection
+        self.stop_line_positions = self.config['stop_line_positions']
+
+        # Camera parameters
+        # fx = self.config['camera_info']['focal_length_x']
+        # fy = self.config['camera_info']['focal_length_y']
+        # image_width = self.config['camera_info']['image_width']
+        # image_height = self.config['camera_info']['image_height']
+        self.camera_param = (fx, fy, cx, cy) = (2552.7, 2280.5, 366, 652.4)  # Manually tweaked
 
         self.upcoming_red_light_pub = rospy.Publisher('/traffic_waypoint', Int32, queue_size=1)
+        self.camera_image_pub = rospy.Publisher('/image_color_info', Image, queue_size=1)
 
         self.bridge = CvBridge()
         self.light_classifier = TLClassifier()
@@ -54,9 +64,10 @@ class TLDetector(object):
 
     def pose_cb(self, msg):
         self.pose = msg
+        self.car_position = msg.pose.position
 
-    def waypoints_cb(self, waypoints):
-        self.waypoints = waypoints
+    def waypoints_cb(self, msg):
+        self.waypoints = msg.waypoints
 
     def traffic_cb(self, msg):
         self.lights = msg.lights
@@ -93,27 +104,25 @@ class TLDetector(object):
                 self.upcoming_red_light_pub.publish(Int32(self.last_wp))
             self.state_count += 1
 
-    def get_closest_waypoint(self, x, y):
-        """Identifies the closest path waypoint to the given position
-            https://en.wikipedia.org/wiki/Closest_pair_of_points_problem
-        Args:
-            pose (Pose): position to match a waypoint to
 
-        Returns:
-            int: index of the closest waypoint in self.waypoints
-
+    def project_car_to_image(self, point):
+        """Project point from 3D car coordinates to 2D camera image location
+           http://docs.opencv.org/2.4/modules/calib3d/doc/camera_calibration_and_3d_reconstruction.html
         """
-        #TODO implement
-        closest_index = None
-        closest_dist = float('inf')
-        for i, wp in enumerate(self.waypoints.waypoints):
-            x_wp = wp.pose.pose.position.x
-            y_wp = wp.pose.pose.position.y
-            dist = math.sqrt((x_wp-x)**2+(y_wp-y)**2)
-            if dist < closest_dist:
-                closest_dist = dist
-                closest_index = i
-        return closest_index
+        fx, fy, cx, cy = self.camera_param
+        p = Point(-point.y, -point.z, point.x)
+        x_img = int(fx*p.x/p.z + cx)
+        y_img = int(fy*p.y/p.z + cy)
+        return (x_img, y_img), p
+
+
+    def bounding_box(self, center, width, height):
+        # Given center point, width and hight of object in car coordinate, return bounding box in image coordinate.
+        top_left = Point(center.x, center.y+width/2, center.z+height/2)
+        bottom_right = Point(center.x, center.y-width/2, center.z-height/2)
+        (left, top),_ = self.project_car_to_image(top_left)
+        (right, bottom),_ = self.project_car_to_image(bottom_right)
+        return left, right, top, bottom
 
 
     def project_to_image_plane(self, point_in_world):
@@ -127,41 +136,26 @@ class TLDetector(object):
             y (int): y coordinate of target point in image
 
         """
-
-        fx = self.config['camera_info']['focal_length_x']
-        fy = self.config['camera_info']['focal_length_y']
-        image_width = self.config['camera_info']['image_width']
-        image_height = self.config['camera_info']['image_height']
-
-        # get transform between pose of camera and world frame
-        trans = None
+        # Get transform between pose of camera and world frame
         try:
             now = rospy.Time.now()
-            self.listener.waitForTransform("/base_link",
-                  "/world", now, rospy.Duration(1.0))
-            (trans, rot) = self.listener.lookupTransform("/base_link",
-                  "/world", now)
-
-            #TODO Use tranform and rotation to calculate 2D position of light in image
-
-            # Transform from world coodinate to front camera coordinate
-            point = PointStamped(Header(0, now, '/world'), point_in_world)
-            point_cam_coord = self.listener.transformPoint('/base_link', point)
-            rospy.loginfo('point_cam_coord: %s' % point_cam_coord)
-
-            # Transform from vehicle camera coodinate to image plane coordinate
-            x_cam = -point_cam_coord.point.y
-            y_cam = -point_cam_coord.point.z
-            z_cam =  point_cam_coord.point.x
-            x_img = fx*image_width*x_cam/z_cam + image_width/2
-            y_img = fy*image_height*y_cam/z_cam + image_height/2
-            rospy.loginfo('(x_img, y_img): %d, %d' % (x_img, y_img))
-            return (x_img, y_img)
-
+            self.listener.waitForTransform('/base_link', '/world', now, rospy.Duration(1.0))
         except (tf.Exception, tf.LookupException, tf.ConnectivityException):
-            rospy.logerr("Failed to find camera to map transform")
-            rospy.loginfo('Failed to find camera to map transform')
+            rospy.logerr('Failed to find camera to map transform')
             return (0, 0)
+
+        # Transform from world coodinate to car coordinate
+        point_wc = PointStamped(Header(0, now, '/world'), point_in_world)
+        point_cc = self.listener.transformPoint('/base_link', point_wc).point
+
+        # Transform from vehicle camera coodinate to image plane coordinate
+        point_img, point_cam = self.project_car_to_image(point_cc)
+
+        # Bounding box for traffic light
+        light_width, light_height = 0.8, 2.2  # In meter. Manually tweaked
+        bb = self.bounding_box(point_cc, light_width, light_height)
+
+        return (point_img, bb, point_cam)
 
 
     def get_light_state(self, light):
@@ -174,18 +168,66 @@ class TLDetector(object):
             int: ID of traffic light color (specified in styx_msgs/TrafficLight)
 
         """
-        if(not self.has_image):
+        if (not self.has_image):
             self.prev_light_loc = None
             return False
 
-        cv_image = self.bridge.imgmsg_to_cv2(self.camera_image, "bgr8")
+        point_img, bb, point_cam = self.project_to_image_plane(light.pose.pose.position)
 
-        x, y = self.project_to_image_plane(light.pose.pose.position)
+        # Put additional information on image and publish for testing. (but latency is large)
+        text = '(%.2f, %.2f, %.2f)' % (point_cam.x, point_cam.y, point_cam.z)
+        cv_image = self.bridge.imgmsg_to_cv2(self.camera_image, "bgr8")
+        cv2.putText(cv_image, 'light in camera coordinate', (50,50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+        cv2.putText(cv_image, text, (50,100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+        cv2.circle(cv_image, point_img, 5, (255,255,255), 2)
+        cv2.rectangle(cv_image, (bb[0],bb[2]), (bb[1],bb[3]), (255,255,255), 2)
+        image_message = self.bridge.cv2_to_imgmsg(cv_image, "bgr8")
+        try:
+            self.camera_image_pub.publish(image_message)
+        except CvBridgeError as e:
+            rospy.loginfo(e)
 
         #TODO use light location to zoom in on traffic light in image
-
         #Get classification
         return self.light_classifier.get_classification(cv_image)
+
+
+    def get_closest_waypoint(self, point):
+        """Identifies the closest path waypoint to the given position
+            https://en.wikipedia.org/wiki/Closest_pair_of_points_problem
+        Args:
+            pose (Pose): position to match a waypoint to
+
+        Returns:
+            int: index of the closest waypoint in self.waypoints
+
+        """
+        closest_index = None
+        closest_dist = float('inf')
+        for i, wp in enumerate(self.waypoints):
+            x_wp = wp.pose.pose.position.x
+            y_wp = wp.pose.pose.position.y
+            dist = math.sqrt((x_wp-point.x)**2+(y_wp-point.y)**2)
+            if dist < closest_dist:
+                closest_dist = dist
+                closest_index = i
+        return closest_index
+
+
+    def get_closest_light(self):
+        car_wp = self.get_closest_waypoint(self.car_position)
+        closest_line = -1
+        closest_dist = len(self.waypoints)
+        for i, line_pos in enumerate(self.stop_line_positions):
+            line_wp = self.get_closest_waypoint(Point(line_pos[0],line_pos[1],0))
+            dist = line_wp - car_wp
+            if dist < 0:
+                dist += len(self.waypoints)
+            if dist < closest_dist:
+                closest_dist = dist
+                closest_line = i
+        return self.lights[closest_line]
+
 
     def process_traffic_lights(self):
         """Finds closest visible traffic light, if one exists, and determines its
@@ -196,37 +238,13 @@ class TLDetector(object):
             int: ID of traffic light color (specified in styx_msgs/TrafficLight)
 
         """
-        light = None
-
-        # List of positions that correspond to the line to stop in front of for a given intersection
-        stop_line_positions = self.config['stop_line_positions']
-        car_x = self.pose.pose.position.x
-        car_y = self.pose.pose.position.y
-        car_position = self.get_closest_waypoint(car_x, car_y)
-
-        #TODO find the closest visible traffic light (if one exists)
-        closest_line_index = -1
-        light_wp = -1
-        closest_dist = len(self.waypoints.waypoints)
-        for i, (line_x, line_y) in enumerate(stop_line_positions):
-            line_position = self.get_closest_waypoint(line_x, line_y)
-            dist = line_position - car_position
-            if dist < 0:
-                dist += len(self.waypoints.waypoints)
-            if dist < closest_dist:
-                closest_dist = dist
-                closest_line_index = i
-                light_wp = line_position
-        # DEBUG
-        # rospy.loginfo('closest_line_index: %d' % closest_line_index)
-        light = self.lights[closest_line_index]  # type(light): TrafficLight
-
+        light = self.get_closest_light()
         if light:
+            light_wp = self.get_closest_waypoint(light.pose.pose.position)
             state = self.get_light_state(light)
             return light_wp, state
-
-        # self.waypoints = None
-        return -1, TrafficLight.UNKNOWN
+        else:
+            return -1, TrafficLight.UNKNOWN
 
 if __name__ == '__main__':
     try:
