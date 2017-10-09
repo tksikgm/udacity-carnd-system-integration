@@ -2,7 +2,7 @@
 import rospy
 from std_msgs.msg import Header, Int32
 from geometry_msgs.msg import PoseStamped, Pose, PointStamped, Point
-from styx_msgs.msg import Lane, TrafficLightArray, TrafficLight, LightImage
+from styx_msgs.msg import Lane, TrafficLightArray, TrafficLight
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
 from light_classification.tl_classifier import TLClassifier
@@ -23,12 +23,12 @@ class TLDetector(object):
         self.lights = []
         self.bridge = CvBridge()
         self.light_classifier = TLClassifier()
+        self.listener = tf.TransformListener()
 
         self.state = TrafficLight.UNKNOWN
         self.last_state = TrafficLight.UNKNOWN
         self.last_wp = -1
         self.state_count = 0
-        self.camera_param = (fx, fy, cx, cy) = (2552.7, 2280.5, 366, 652.4)  # Manually estimated camera parameters
 
         # Reading values from config file.
         config_string = rospy.get_param("/traffic_light_config")
@@ -37,6 +37,13 @@ class TLDetector(object):
         self.stop_line_positions = self.config['stop_line_positions']
         self.image_width = self.config['camera_info']['image_width']
         self.image_height = self.config['camera_info']['image_height']
+        self.camera_param = (2552.7, 2280.5, 366, 652.4)  # Manually estimated simulator camera parameters
+        # For site driving.
+        # fx = self.config['camera_info']['focal_length_x']
+        # fy = self.config['camera_info']['focal_length_y']
+        # cx = self.image_width/2
+        # cy = self.image_height/2
+        # self.camera_param = (fx, fy, cx, cy)
 
         # Subscribers
         sub1 = rospy.Subscriber('/current_pose', PoseStamped, self.pose_cb)
@@ -53,7 +60,7 @@ class TLDetector(object):
 
         # Publishers
         self.upcoming_red_light_pub = rospy.Publisher('/traffic_waypoint', Int32, queue_size=1)
-        self.light_image_pub = rospy.Publisher('/image_color_light', LightImage, queue_size=1)
+        self.light_image_pub = rospy.Publisher('/image_color_light', Image, queue_size=1)
 
         rospy.spin()
 
@@ -129,15 +136,17 @@ class TLDetector(object):
 
 
     def project_world_to_car(self, point_world_coord):
-        transform_listener = tf.TransformListener()
+        # transform_listener = tf.TransformListener()
         now = rospy.Time.now()
         try:
-            transform_listener.waitForTransform('/base_link', '/world', now, rospy.Duration(1.0))
+            # transform_listener = tf.TransformListener()
+            # now = rospy.Time.now()
+            self.listener.waitForTransform('/base_link', '/world', now, rospy.Duration(1.0))
         except (tf.Exception, tf.LookupException, tf.ConnectivityException):
             rospy.logerr('Failed to find camera to map transform')
             return None
         point_stamped_msg = PointStamped(Header(0, now, '/world'), point_world_coord)
-        point_car_coord = transform_listener.transformPoint('/base_link', point_stamped_msg).point
+        point_car_coord = self.listener.transformPoint('/base_link', point_stamped_msg).point
         return point_car_coord
 
 
@@ -190,25 +199,31 @@ class TLDetector(object):
         light, light_wp = self.get_closest_light()
         light_world_coord = light.pose.pose.position
         light_car_coord = self.project_world_to_car(light_world_coord)
-        if light_car_coord.x > 100:
+        if light_car_coord == None:
+            return -1, TrafficLight.UNKNOWN
+        elif light_car_coord.x > 100:
             rospy.loginfo('Traffic light too far from car.')
             return -1, TrafficLight.UNKNOWN
 
         zoomed_image = self.get_zoomed_light_image(light_car_coord)
-        if zoomed_image == None:
-            return -1, TrafficLight.UNKNOWN
+        try:
+            if zoomed_image == None:
+                return -1, TrafficLight.UNKNOWN
+        except:
+            pass
 
         # Show zoomed image
-        cv2.imshow("Image window", zoomed_image)
+        cv2.imshow('Zoomed image', zoomed_image)
         cv2.waitKey(1)
         # Publish zoomed image
-        msg = LightImage(self.bridge.cv2_to_imgmsg(zoomed_image, "bgr8"), light.state)
+        msg = self.bridge.cv2_to_imgmsg(zoomed_image, "bgr8")
         try:
             self.light_image_pub.publish(msg)
         except CvBridgeError as e:
             rospy.loginfo(e)
 
-        state = self.light_classifier.get_classification(zoomed_image)
+        # state = self.light_classifier.get_classification(zoomed_image)
+        state = -1
         return light_wp, state
 
 
