@@ -2,7 +2,7 @@
 import rospy
 from std_msgs.msg import Header, Int32
 from geometry_msgs.msg import PoseStamped, Pose, PointStamped, Point
-from styx_msgs.msg import Lane, TrafficLightArray, TrafficLight
+from styx_msgs.msg import Lane, TrafficLightArray, TrafficLight, LightImage
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
 from light_classification.tl_classifier import TLClassifier
@@ -27,6 +27,7 @@ class TLDetector(object):
 
         self.state = TrafficLight.UNKNOWN
         self.last_state = TrafficLight.UNKNOWN
+        self.last_image = None
         self.last_wp = -1
         self.state_count = 0
 
@@ -60,7 +61,7 @@ class TLDetector(object):
 
         # Publishers
         self.upcoming_red_light_pub = rospy.Publisher('/traffic_waypoint', Int32, queue_size=1)
-        self.light_image_pub = rospy.Publisher('/image_color_light', Image, queue_size=1)
+        self.light_image_pub = rospy.Publisher('/image_color_light', LightImage, queue_size=1)
 
         rospy.spin()
 
@@ -125,8 +126,8 @@ class TLDetector(object):
 
     def get_zoomed_light_image(self, light_car_coord):
         light_image_coord = self.project_car_to_image(light_car_coord)
-        cv_image = self.bridge.imgmsg_to_cv2(self.camera_image, "bgr8")
-        left, right, top, bottom = self.get_bounding_box(light_car_coord, 3, 3)
+        cv_image = self.bridge.imgmsg_to_cv2(self.camera_image, 'bgr8')
+        left, right, top, bottom = self.get_bounding_box(light_car_coord, 3.2, 3.2)
         if left<0 or right>self.image_width or top<0 or bottom>self.image_height:
             rospy.loginfo('Bonding box out of image.')
             return None
@@ -136,16 +137,13 @@ class TLDetector(object):
 
 
     def project_world_to_car(self, point_world_coord):
-        # transform_listener = tf.TransformListener()
-        now = rospy.Time.now()
+        time = self.camera_image.header.stamp
         try:
-            # transform_listener = tf.TransformListener()
-            # now = rospy.Time.now()
-            self.listener.waitForTransform('/base_link', '/world', now, rospy.Duration(1.0))
+            self.listener.waitForTransform('/base_link', '/world', time, rospy.Duration(1.0))
         except (tf.Exception, tf.LookupException, tf.ConnectivityException):
             rospy.logerr('Failed to find camera to map transform')
             return None
-        point_stamped_msg = PointStamped(Header(0, now, '/world'), point_world_coord)
+        point_stamped_msg = PointStamped(Header(0, time, '/world'), point_world_coord)
         point_car_coord = self.listener.transformPoint('/base_link', point_stamped_msg).point
         return point_car_coord
 
@@ -199,9 +197,11 @@ class TLDetector(object):
         light, light_wp = self.get_closest_light()
         light_world_coord = light.pose.pose.position
         light_car_coord = self.project_world_to_car(light_world_coord)
+        # rospy.loginfo(light_car_coord)
+        # light_car_coord = Point(41, 0, 5.5)
         if light_car_coord == None:
             return -1, TrafficLight.UNKNOWN
-        elif light_car_coord.x > 100:
+        elif light_car_coord.x > 150:
             rospy.loginfo('Traffic light too far from car.')
             return -1, TrafficLight.UNKNOWN
 
@@ -215,15 +215,14 @@ class TLDetector(object):
         # Show zoomed image
         cv2.imshow('Zoomed image', zoomed_image)
         cv2.waitKey(1)
-        # Publish zoomed image
-        msg = self.bridge.cv2_to_imgmsg(zoomed_image, "bgr8")
-        try:
+        # Publish zoomed image (for training classifier)
+        if self.last_state == light.state:
+            msg = LightImage(self.bridge.cv2_to_imgmsg(self.last_image, 'bgr8'), self.last_state)
             self.light_image_pub.publish(msg)
-        except CvBridgeError as e:
-            rospy.loginfo(e)
+        self.last_image = zoomed_image
 
         # state = self.light_classifier.get_classification(zoomed_image)
-        state = -1
+        state = light.state
         return light_wp, state
 
 
