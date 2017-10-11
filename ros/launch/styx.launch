@@ -22,8 +22,7 @@
     <param name="traffic_light_config" textfile="$(find tl_detector)/sim_traffic_light_config.yaml" />
 
     <!-- Image view node -->
-    <node name="image_view" pkg="image_view" type="image_view">
-      <!-- <remap from="image" to="/image_color" /> -->
-      <remap from="image" to="/image_color_info" />
-    </node>
+    <!-- <node name="image_view" pkg="image_view" type="image_view">
+      <remap from="image" to="/image_color" />
+    </node> -->
 </launch>
